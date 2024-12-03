@@ -20,6 +20,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/PuerkitoBio/rehttp"
 	"github.com/alecthomas/kingpin/v2"
@@ -185,6 +186,7 @@ type handler struct {
 	metricsExtraFilters []collectors.MetricFilter
 	additionalGatherer  prometheus.Gatherer
 	m                   *monitoring.Service
+	collectors          *collectors.CollectorCache
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -203,6 +205,20 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func newHandler(projectIDs []string, metricPrefixes []string, metricExtraFilters []collectors.MetricFilter, m *monitoring.Service, logger *slog.Logger, additionalGatherer prometheus.Gatherer) *handler {
+	ttl := 2 * time.Hour
+	// Add collector caching TTL as max of deltas aggregation or descriptor caching
+	if *monitoringMetricsAggregateDeltas || *monitoringDescriptorCacheTTL > 0 {
+		featureTTL := *monitoringMetricsDeltasTTL
+		if *monitoringDescriptorCacheTTL > featureTTL {
+			featureTTL = *monitoringDescriptorCacheTTL
+		}
+		if featureTTL > ttl {
+			ttl = featureTTL
+		}
+	}
+
+	logger.Info("Creating collector cache", "ttl", ttl)
+
 	h := &handler{
 		logger:              logger,
 		projectIDs:          projectIDs,
@@ -210,28 +226,45 @@ func newHandler(projectIDs []string, metricPrefixes []string, metricExtraFilters
 		metricsExtraFilters: metricExtraFilters,
 		additionalGatherer:  additionalGatherer,
 		m:                   m,
+		collectors:          collectors.NewCollectorCache(ttl),
 	}
 
 	h.handler = h.innerHandler(nil)
 	return h
 }
 
+func (h *handler) getCollector(project string, filters map[string]bool) (*collectors.MonitoringCollector, error) {
+	filterdPrefixes := h.filterMetricTypePrefixes(filters)
+	collectorKey := fmt.Sprintf("%s-%v", project, filterdPrefixes)
+
+	if collector, found := h.collectors.Get(collectorKey); found {
+		return collector, nil
+	}
+
+	collector, err := collectors.NewMonitoringCollector(project, h.m, collectors.MonitoringCollectorOptions{
+		MetricTypePrefixes:        h.filterMetricTypePrefixes(filters),
+		ExtraFilters:              h.metricsExtraFilters,
+		RequestInterval:           *monitoringMetricsInterval,
+		RequestOffset:             *monitoringMetricsOffset,
+		IngestDelay:               *monitoringMetricsIngestDelay,
+		FillMissingLabels:         *collectorFillMissingLabels,
+		DropDelegatedProjects:     *monitoringDropDelegatedProjects,
+		AggregateDeltas:           *monitoringMetricsAggregateDeltas,
+		DescriptorCacheTTL:        *monitoringDescriptorCacheTTL,
+		DescriptorCacheOnlyGoogle: *monitoringDescriptorCacheOnlyGoogle,
+	}, h.logger, delta.NewInMemoryCounterStore(h.logger, *monitoringMetricsDeltasTTL), delta.NewInMemoryHistogramStore(h.logger, *monitoringMetricsDeltasTTL))
+	if err != nil {
+		return nil, err
+	}
+	h.collectors.Store(collectorKey, collector)
+	return collector, nil
+}
+
 func (h *handler) innerHandler(filters map[string]bool) http.Handler {
 	registry := prometheus.NewRegistry()
 
 	for _, project := range h.projectIDs {
-		monitoringCollector, err := collectors.NewMonitoringCollector(project, h.m, collectors.MonitoringCollectorOptions{
-			MetricTypePrefixes:        h.filterMetricTypePrefixes(filters),
-			ExtraFilters:              h.metricsExtraFilters,
-			RequestInterval:           *monitoringMetricsInterval,
-			RequestOffset:             *monitoringMetricsOffset,
-			IngestDelay:               *monitoringMetricsIngestDelay,
-			FillMissingLabels:         *collectorFillMissingLabels,
-			DropDelegatedProjects:     *monitoringDropDelegatedProjects,
-			AggregateDeltas:           *monitoringMetricsAggregateDeltas,
-			DescriptorCacheTTL:        *monitoringDescriptorCacheTTL,
-			DescriptorCacheOnlyGoogle: *monitoringDescriptorCacheOnlyGoogle,
-		}, h.logger, delta.NewInMemoryCounterStore(h.logger, *monitoringMetricsDeltasTTL), delta.NewInMemoryHistogramStore(h.logger, *monitoringMetricsDeltasTTL))
+		monitoringCollector, err := h.getCollector(project, filters)
 		if err != nil {
 			h.logger.Error("error creating monitoring collector", "err", err)
 			os.Exit(1)
@@ -257,12 +290,14 @@ func (h *handler) filterMetricTypePrefixes(filters map[string]bool) []string {
 	if len(filters) > 0 {
 		filteredPrefixes = nil
 		for _, prefix := range h.metricsPrefixes {
-			if filters[prefix] {
-				filteredPrefixes = append(filteredPrefixes, prefix)
+			for filter, _ := range filters {
+				if strings.HasPrefix(filter, prefix) {
+					filteredPrefixes = append(filteredPrefixes, filter)
+				}
 			}
 		}
 	}
-	return filteredPrefixes
+	return parseMetricTypePrefixes(filteredPrefixes)
 }
 
 func main() {
